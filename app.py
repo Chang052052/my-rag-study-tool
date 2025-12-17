@@ -1,179 +1,148 @@
 import streamlit as st
-from pypdf import PdfReader
-import re
+import fitz  # 这是 PyMuPDF 库
+from PIL import Image
+import io
 
 # ==========================================
-# 1. 界面配置
+# 1. 页面配置 (开启宽屏模式)
 # ==========================================
-st.set_page_config(
-    page_title="Scholar Flow RAG Multi", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(layout="wide", page_title="Scholar Flow Visual")
 
-# CSS: 优化卡片样式，增加文件名字段的显示
+# CSS 美化
 st.markdown("""
 <style>
-    .result-card {
-        background-color: #f8fafc;
+    .result-box {
         padding: 15px;
+        border: 1px solid #e5e7eb;
         border-radius: 8px;
-        border-left: 4px solid #3b82f6;
-        margin-bottom: 15px;
-        border: 1px solid #e2e8f0;
+        margin-bottom: 10px;
+        background-color: #f9fafb;
+        transition: 0.3s;
     }
-    .meta-tag {
-        background-color: #e0f2fe;
-        color: #0369a1;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        margin-right: 10px;
-        display: inline-block;
+    .result-box:hover {
+        border-color: #3b82f6;
+        background-color: #eff6ff;
     }
-    /* 强制渲染数学公式字体 */
-    .katex { font-size: 1.1em; }
+    .highlight {
+        background-color: #fef9c3;
+        font-weight: bold;
+        padding: 0 2px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 核心逻辑 (支持多文件)
+# 2. 核心逻辑 (使用 PyMuPDF)
 # ==========================================
 
-@st.cache_data
-def process_pdf(file):
-    """读取单个 PDF 并提取文本"""
-    pages_data = []
-    try:
-        reader = PdfReader(file)
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text()
-            if text:
-                # 清洗空白字符
-                clean_text = re.sub(r'\s+', ' ', text).strip()
-                # 记录文件名、页码、文本
-                pages_data.append({
-                    "filename": file.name,
-                    "page": i + 1, 
-                    "text": clean_text
-                })
-    except Exception as e:
-        st.error(f"解析 {file.name} 失败: {e}")
-    return pages_data
+@st.cache_resource
+def load_pdf(file):
+    """加载 PDF 文件到内存"""
+    return fitz.open(stream=file.read(), filetype="pdf")
 
-def search_engine(query, all_pages_data):
+def search_in_pdf(doc, query):
+    """在 PDF 中搜索关键词"""
     results = []
-    keywords = [k.lower() for k in query.split() if len(k) > 1]
+    query_lower = query.lower()
+    keywords = query_lower.split()
     
-    if not keywords: return []
-
-    for data in all_pages_data:
-        text = data['text']
+    for page_num, page in enumerate(doc):
+        text = page.get_text()
         text_lower = text.lower()
         
-        # 评分机制
+        # 简单的评分机制
         score = 0
         for k in keywords:
             if k in text_lower:
                 score += 1
         
         if score > 0:
-            # 智能截取上下文
-            first_idx = text_lower.find(keywords[0])
-            start = max(0, first_idx - 150)
-            end = min(len(text), first_idx + 350)
+            # 截取一段文字作为预览
+            idx = text_lower.find(keywords[0])
+            start = max(0, idx - 100)
+            end = min(len(text), idx + 200)
+            snippet = text[start:end].replace("\n", " ")
             
-            snippet = text[start:end]
-            if start > 0: snippet = "..." + snippet
-            if end < len(text): snippet = snippet + "..."
-            
-            # 高亮处理 (Markdown 粗体)
-            for k in keywords:
-                pattern = re.compile(re.escape(k), re.IGNORECASE)
-                snippet = pattern.sub(lambda m: f"**{m.group(0)}**", snippet)
-
             results.append({
-                "filename": data['filename'],
-                "page": data['page'],
+                "page": page_num,
                 "score": score,
-                "snippet": snippet
+                "snippet": "..." + snippet + "..."
             })
             
-    # 按分数排序
+    # 按相关度排序
     results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:8] # 多文件时返回更多结果
+    return results[:10]
 
 # ==========================================
 # 3. 界面布局
 # ==========================================
 
+st.title("🎓 Scholar Flow Visual")
+st.caption("左侧搜索关键词，点击结果 -> 右侧显示【PDF原页】（完美数学公式）")
+
+# 初始化 session state 用于存储当前查看的页面
+if 'current_page_img' not in st.session_state:
+    st.session_state.current_page_img = None
+if 'current_doc_name' not in st.session_state:
+    st.session_state.current_doc_name = ""
+
+# --- 侧边栏：上传 ---
 with st.sidebar:
-    st.title("📚 知识库 (Library)")
+    st.header("📂 上传文件")
+    uploaded_file = st.file_uploader("选择 PDF", type=["pdf"])
     
-    # === 关键修改：accept_multiple_files=True ===
-    uploaded_files = st.file_uploader(
-        "上传 PDF (支持多选)", 
-        type=['pdf'], 
-        accept_multiple_files=True
-    )
+    doc = None
+    if uploaded_file:
+        doc = load_pdf(uploaded_file)
+        st.success(f"已加载: {uploaded_file.name} ({len(doc)} 页)")
+
+# --- 主界面：双栏布局 ---
+col_search, col_view = st.columns([1, 1.2]) # 左窄右宽
+
+with col_search:
+    st.subheader("🔍 搜索")
+    query = st.text_input("输入关键词 (如: holomorphic definition)", placeholder="回车搜索...")
     
-    knowledge_base = []
-    
-    if uploaded_files:
-        with st.spinner(f"正在分析 {len(uploaded_files)} 个文件..."):
-            for file in uploaded_files:
-                # 循环处理每个文件，并将结果合并到 knowledge_base
-                file_pages = process_pdf(file)
-                knowledge_base.extend(file_pages)
-                
-        st.success(f"✅ 已加载 {len(uploaded_files)} 个文件\n共 {len(knowledge_base)} 页笔记")
+    if doc and query:
+        results = search_in_pdf(doc, query)
         
-        # 显示已加载的文件列表
-        with st.expander("已加载文件列表"):
-            for f in uploaded_files:
-                st.text(f"• {f.name}")
-
-st.title("🎓 Scholar Flow Multi")
-st.caption("支持多文件检索的 AI 学习助手")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "你好！请一次性上传所有相关的 Lecture Notes 或考卷，我会跨文件为你寻找答案。"}]
-
-# 显示历史
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if "div class" in msg["content"]:
-             st.markdown(msg["content"], unsafe_allow_html=True)
+        if not results:
+            st.warning("未找到匹配内容")
         else:
-             st.write(msg["content"])
-
-# 输入框
-if query := st.chat_input("输入问题 (例如: definition of holomorphic)"):
-    st.session_state.messages.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.write(query)
-
-    with st.chat_message("assistant"):
-        if not knowledge_base:
-            st.warning("⚠️ 请先在左侧上传至少一个 PDF 文件。")
-        else:
-            results = search_engine(query, knowledge_base)
+            st.write(f"找到 {len(results)} 个结果：")
             
-            if results:
-                for res in results:
-                    # 显示文件名 + 页码
-                    st.markdown(f"""
-                    <div class="result-card">
-                        <span class="meta-tag">📄 {res['filename']}</span>
-                        <span class="meta-tag">第 {res['page']} 页</span>
-                        <div style="color: #334155; line-height: 1.6; margin-top:8px;">
-                    """, unsafe_allow_html=True)
+            # 遍历显示结果
+            for i, res in enumerate(results):
+                # 使用 Streamlit 原生容器做卡片
+                with st.container():
+                    st.markdown(f"**📄 第 {res['page'] + 1} 页**")
+                    st.caption(res['snippet'])
                     
-                    st.markdown(res['snippet'])
+                    # 关键：点击按钮，更新右侧的图片
+                    if st.button(f"查看原图 (结果 {i+1})", key=f"btn_{i}"):
+                        # 1. 获取该页
+                        page = doc[res['page']]
+                        # 2. 渲染成高清图片 (zoom=2 表示2倍清晰度)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        # 3. 转换格式供显示
+                        img_data = pix.tobytes("png")
+                        st.session_state.current_page_img = img_data
+                        st.session_state.current_doc_name = f"第 {res['page'] + 1} 页"
                     
-                    st.markdown("</div></div>", unsafe_allow_html=True)
-                    
-                st.session_state.messages.append({"role": "assistant", "content": "✅ 搜索完成 (见上方卡片)"})
-            else:
-                st.error("在所有文件中均未找到相关内容。")
+                    st.markdown("---")
+
+with col_view:
+    st.subheader("📄 阅读视图")
+    
+    if st.session_state.current_page_img:
+        st.info(f"正在查看：{st.session_state.current_doc_name}")
+        st.image(st.session_state.current_page_img, use_column_width=True)
+    else:
+        st.markdown(
+            """
+            <div style="height: 400px; border: 2px dashed #ccc; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #888;">
+                👈 请在左侧点击“查看原图”按钮
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
